@@ -1,0 +1,8 @@
+{
+  "name": "Phone recording test",
+  "short_name": "Rec test",
+  "start_url": "./",
+  "display": "standalone",
+  "background_color": "#121212",
+  "theme_color": "#121212"
+}

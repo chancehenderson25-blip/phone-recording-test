@@ -1,0 +1,372 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-title" content="Rec test">
+<link rel="manifest" href="manifest.webmanifest">
+<title>Phone Recording Test</title>
+<!--
+  One-time test: can a web app on the shop's iPhone record a 3-10 minute walkaround
+  reliably and keep it for upload later? (status.md; 35 § 13.)
+  Videos stay on the phone. Nothing is uploaded. The report holds no video and no customer data.
+-->
+<style>
+:root{--bg:#f4f4f2;--fg:#1a1a1a;--muted:#5c5c5c;--card:#fff;--line:#d8d8d4;--accent:#0b63ce;--rec:#c62828;--ok:#2e7d32;--warn:#b26a00}
+@media (prefers-color-scheme:dark){:root:not([data-theme="light"]){--bg:#121212;--fg:#ececec;--muted:#a3a3a3;--card:#1e1e1e;--line:#333;--accent:#5aa0ff;--rec:#ef5350;--ok:#66bb6a;--warn:#ffb74d}}
+:root[data-theme="dark"]{--bg:#121212;--fg:#ececec;--muted:#a3a3a3;--card:#1e1e1e;--line:#333;--accent:#5aa0ff;--rec:#ef5350;--ok:#66bb6a;--warn:#ffb74d}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--fg);font:16px/1.4 -apple-system,system-ui,sans-serif;padding:16px 16px calc(16px + env(safe-area-inset-bottom))}
+h1{font-size:20px;margin:0 0 4px}
+h2{font-size:16px;margin:20px 0 8px}
+p,li{color:var(--muted);margin:4px 0}
+.card{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:12px;margin:12px 0}
+video{width:100%;max-height:45vh;background:#000;border-radius:8px}
+.row{display:flex;gap:8px;flex-wrap:wrap;margin:8px 0}
+button,select{font:inherit;min-height:56px;padding:0 16px;border-radius:10px;border:1px solid var(--line);background:var(--card);color:var(--fg)}
+button.primary{background:var(--accent);border-color:var(--accent);color:#fff;flex:1}
+button.rec{background:var(--rec);border-color:var(--rec);color:#fff;flex:1}
+button:disabled{opacity:.45}
+select{flex:1;min-width:0}
+#status{font-variant-numeric:tabular-nums;font-weight:600}
+#log{font:12px/1.35 ui-monospace,Menlo,monospace;white-space:pre-wrap;max-height:30vh;overflow:auto;color:var(--muted)}
+.rec-item{border-top:1px solid var(--line);padding:10px 0}
+.rec-item:first-child{border-top:0}
+.ok{color:var(--ok)}.warn{color:var(--warn)}.bad{color:var(--rec)}
+ol{padding-left:20px}
+textarea{width:100%;height:30vh;font:12px ui-monospace,Menlo,monospace;background:var(--card);color:var(--fg);border:1px solid var(--line);border-radius:8px}
+</style>
+</head>
+<body>
+<h1>Phone recording test</h1>
+<p>Checks whether a web app on this phone can film a long walkaround and keep it safe. Videos stay on this phone. Nothing is uploaded.</p>
+<p id="mode"></p>
+
+<div class="card">
+  <video id="preview" playsinline muted autoplay></video>
+  <div class="row">
+    <button id="camOn" class="primary">Turn camera on</button>
+  </div>
+  <div class="row">
+    <select id="camSel" disabled><option>Camera</option></select>
+    <button id="torch" disabled>Torch</button>
+  </div>
+  <div class="row">
+    <button id="recBtn" class="rec" disabled>Start recording</button>
+  </div>
+  <div id="status">Not recording</div>
+</div>
+
+<div class="card">
+  <h2 style="margin-top:0">Steps</h2>
+  <ol>
+    <li>In Safari: Share → Add to Home Screen. Open it from the Home Screen icon.</li>
+    <li>Turn the camera on, start recording, walk a car for about 10 minutes and talk as usual.</li>
+    <li>Partway through: pull down Control Center for 5 seconds. Lock the phone for 10 seconds, then unlock. Switch to another app and back.</li>
+    <li>Stop. Play it back below. Note any part with no picture or no sound.</li>
+    <li>Record about 1 minute more, then swipe the app closed <b>without stopping</b>. Open it again: is that recording listed and playable?</li>
+    <li>Tap "Copy report" and paste it to Claude.</li>
+  </ol>
+</div>
+
+<h2>Recordings on this phone</h2>
+<div class="card" id="recs"><p>None yet.</p></div>
+<div class="row">
+  <button id="reportBtn" class="primary">Copy report</button>
+  <button id="delAll">Delete all</button>
+</div>
+<textarea id="reportBox" hidden readonly></textarea>
+
+<h2>Events</h2>
+<div class="card"><div id="log"></div></div>
+
+<script>
+const $ = s => document.querySelector(s);
+const BITRATE = 4000000; // 4 Mbps: about 300 MB per 10 minutes. Safari's default is higher.
+const GAP_MS = 3000;     // chunks are asked for every 1 s; a wait over 3 s is logged as a gap
+const env = {};
+let db, stream, recorder, cur = null, seq = 0, lastChunkAt = 0, wakeLock = null, tick = null, torchOn = false;
+const played = {};
+
+const t = () => new Date().toTimeString().slice(0, 8);
+function ev(msg) {
+  $('#log').textContent = `${t()} ${msg}\n` + $('#log').textContent;
+  if (cur) put('events', { recId: cur.id, t: Date.now(), msg }).catch(() => {});
+}
+
+// ---- storage (IndexedDB) ----
+function openDB() {
+  return new Promise((res, rej) => {
+    const r = indexedDB.open('phonetest', 1);
+    r.onupgradeneeded = () => {
+      const d = r.result;
+      d.createObjectStore('recs', { keyPath: 'id' });
+      d.createObjectStore('chunks', { autoIncrement: true }).createIndex('rec', 'recId');
+      d.createObjectStore('events', { autoIncrement: true }).createIndex('rec', 'recId');
+      d.createObjectStore('marks', { autoIncrement: true }).createIndex('rec', 'recId');
+    };
+    r.onsuccess = () => res(r.result);
+    r.onerror = () => rej(r.error);
+  });
+}
+function put(store, val, store2, val2) {
+  return new Promise((res, rej) => {
+    const tx = db.transaction(store2 ? [store, store2] : store, 'readwrite');
+    tx.objectStore(store).put(val);
+    if (store2) tx.objectStore(store2).put(val2);
+    tx.oncomplete = () => res();
+    tx.onerror = () => rej(tx.error);
+  });
+}
+function all(store) {
+  return new Promise((res, rej) => {
+    const r = db.transaction(store).objectStore(store).getAll();
+    r.onsuccess = () => res(r.result);
+    r.onerror = () => rej(r.error);
+  });
+}
+function byRec(store, recId, del = false) {
+  return new Promise((res, rej) => {
+    const out = [];
+    const tx = db.transaction(store, del ? 'readwrite' : 'readonly');
+    const req = tx.objectStore(store).index('rec').openCursor(IDBKeyRange.only(recId));
+    req.onsuccess = () => {
+      const c = req.result;
+      if (!c) return;
+      if (del) c.delete(); else out.push(c.value);
+      c.continue();
+    };
+    tx.oncomplete = () => res(out);
+    tx.onerror = () => rej(tx.error);
+  });
+}
+async function delRec(id) {
+  await byRec('chunks', id, true);
+  await byRec('events', id, true);
+  await byRec('marks', id, true);
+  await new Promise((res, rej) => {
+    const tx = db.transaction('recs', 'readwrite');
+    tx.objectStore('recs').delete(id);
+    tx.oncomplete = res; tx.onerror = () => rej(tx.error);
+  });
+}
+
+// ---- environment ----
+async function checkEnv() {
+  env.ua = navigator.userAgent;
+  env.standalone = window.matchMedia('(display-mode: standalone)').matches || navigator.standalone === true;
+  env.mediaRecorder = 'MediaRecorder' in window;
+  env.types = ['video/mp4;codecs=avc1,mp4a', 'video/mp4', 'video/webm'].filter(m => env.mediaRecorder && MediaRecorder.isTypeSupported(m));
+  env.wakeLock = 'wakeLock' in navigator;
+  env.share = !!(navigator.canShare);
+  if (navigator.storage) {
+    try { env.persistedBefore = await navigator.storage.persisted(); } catch (e) { env.persistedBefore = 'error'; }
+    try { env.persist = await navigator.storage.persist(); } catch (e) { env.persist = 'error ' + e.name; }
+    await refreshEstimate();
+  }
+  $('#mode').innerHTML = env.standalone
+    ? '<span class="ok">Running from the Home Screen.</span>'
+    : '<span class="warn">Running in a Safari tab. For the real test, add it to the Home Screen and open it from there.</span>';
+  if (!env.mediaRecorder) ev('MediaRecorder is missing on this browser');
+}
+async function refreshEstimate() {
+  try { const e = await navigator.storage.estimate(); env.usageMB = Math.round(e.usage / 1e6); env.quotaMB = Math.round(e.quota / 1e6); } catch (e) {}
+}
+
+// ---- camera ----
+async function camOn(deviceId) {
+  if (stream) stream.getTracks().forEach(tr => tr.stop());
+  const video = deviceId
+    ? { deviceId: { exact: deviceId }, width: { ideal: 1920 }, height: { ideal: 1080 } }
+    : { facingMode: { ideal: 'environment' }, width: { ideal: 1920 }, height: { ideal: 1080 } };
+  stream = await navigator.mediaDevices.getUserMedia({ video, audio: true });
+  $('#preview').srcObject = stream;
+  for (const tr of stream.getTracks()) {
+    tr.onmute = () => ev(`${tr.kind} muted (no ${tr.kind === 'video' ? 'picture' : 'sound'} coming in)`);
+    tr.onunmute = () => ev(`${tr.kind} back`);
+    tr.onended = () => ev(`${tr.kind} ended`);
+  }
+  const vt = stream.getVideoTracks()[0];
+  const s = vt.getSettings();
+  env.camera = `${vt.label} ${s.width}x${s.height} @${s.frameRate ? Math.round(s.frameRate) : '?'}fps`;
+  const caps = vt.getCapabilities ? vt.getCapabilities() : {};
+  env.torch = !!caps.torch;
+  env.zoom = caps.zoom ? `${caps.zoom.min}-${caps.zoom.max}` : 'no';
+  $('#torch').disabled = !env.torch;
+  torchOn = false; $('#torch').textContent = 'Torch';
+  ev(`camera on: ${env.camera}; torch ${env.torch ? 'yes' : 'no'}; zoom ${env.zoom}`);
+  await listCams(vt.getSettings().deviceId);
+  $('#recBtn').disabled = !env.mediaRecorder;
+  $('#camOn').textContent = 'Restart camera';
+}
+async function listCams(active) {
+  const devs = (await navigator.mediaDevices.enumerateDevices()).filter(d => d.kind === 'videoinput');
+  env.cameras = devs.map(d => d.label || '(no label)');
+  const sel = $('#camSel');
+  sel.innerHTML = devs.map(d => `<option value="${d.deviceId}" ${d.deviceId === active ? 'selected' : ''}>${d.label || 'Camera'}</option>`).join('');
+  sel.disabled = !!cur;
+}
+
+// ---- recording ----
+async function startRec() {
+  const mime = env.types[0];
+  recorder = new MediaRecorder(stream, mime ? { mimeType: mime, videoBitsPerSecond: BITRATE } : { videoBitsPerSecond: BITRATE });
+  cur = { id: Date.now().toString(36), started: Date.now(), mime: recorder.mimeType || mime || '?', camera: env.camera, ended: null };
+  seq = 0; lastChunkAt = 0;
+  const recId = cur.id, started = cur.started;
+  let bytes = 0;
+  await put('recs', cur);
+  recorder.ondataavailable = async e => {
+    const n = seq++, now = Date.now();
+    if (lastChunkAt && now - lastChunkAt > GAP_MS) ev(`gap: no data for ${((now - lastChunkAt) / 1000).toFixed(1)} s`);
+    lastChunkAt = now;
+    if (!e.data.size) ev(`empty chunk #${n}`);
+    try {
+      const buf = await e.data.arrayBuffer();
+      await put('chunks', { recId, seq: n, buf }, 'marks', { recId, seq: n, t: now, size: buf.byteLength });
+      bytes += buf.byteLength;
+    } catch (err) { ev(`chunk #${n} not saved: ${err.name}`); }
+  };
+  recorder.onerror = e => ev(`recorder error: ${e.error ? e.error.name + ' ' + e.error.message : '?'}`);
+  recorder.onstop = async () => {
+    ev('recording stopped');
+    const r = (await all('recs')).find(x => x.id === recId);
+    if (r) { r.ended = Date.now(); await put('recs', r); }
+    cur = null;
+    clearInterval(tick);
+    if (wakeLock) { wakeLock.release().catch(() => {}); wakeLock = null; }
+    $('#recBtn').textContent = 'Start recording';
+    $('#camSel').disabled = false;
+    $('#status').textContent = 'Not recording';
+    await refreshEstimate();
+    renderRecs();
+  };
+  recorder.start(1000);
+  ev(`recording started: ${cur.mime}, asked for ${BITRATE / 1e6} Mbps`);
+  if (env.wakeLock) {
+    try { wakeLock = await navigator.wakeLock.request('screen'); ev('screen kept awake'); }
+    catch (e) { ev(`screen wake lock refused: ${e.name}`); }
+  }
+  $('#recBtn').textContent = 'Stop recording';
+  $('#camSel').disabled = true;
+  tick = setInterval(() => {
+    if (!cur) return;
+    const s = Math.round((Date.now() - started) / 1000);
+    $('#status').innerHTML = `<span class="bad">● REC</span> ${Math.floor(s / 60)}:${String(s % 60).padStart(2, '0')} · ${(bytes / 1e6).toFixed(0)} MB saved`;
+  }, 2000);
+}
+
+// ---- list, play, share ----
+async function summary(r) {
+  const chunks = (await byRec('marks', r.id)).sort((a, b) => a.seq - b.seq);
+  const events = (await byRec('events', r.id)).sort((a, b) => a.t - b.t);
+  const bytes = chunks.reduce((a, c) => a + c.size, 0);
+  const last = chunks.length ? chunks[chunks.length - 1].t : r.started;
+  let gaps = 0;
+  for (let i = 1; i < chunks.length; i++) if (chunks[i].t - chunks[i - 1].t > GAP_MS) gaps++;
+  const status = r.ended ? 'stopped normally' : (cur && cur.id === r.id ? 'recording now' : 'cut off (app closed while recording)');
+  return { r, chunks, events, bytes, secs: Math.round((last - r.started) / 1000), empty: chunks.filter(c => !c.size).length, gaps, status };
+}
+async function blobOf(s) {
+  const chunks = (await byRec('chunks', s.r.id)).sort((a, b) => a.seq - b.seq);
+  return new Blob(chunks.map(c => c.buf), { type: s.r.mime.split(';')[0] });
+}
+
+async function renderRecs() {
+  const recs = (await all('recs')).sort((a, b) => b.started - a.started);
+  const box = $('#recs');
+  if (!recs.length) { box.innerHTML = '<p>None yet.</p>'; return; }
+  box.innerHTML = '';
+  for (const r of recs) {
+    const s = await summary(r);
+    const div = document.createElement('div');
+    div.className = 'rec-item';
+    const cls = s.status === 'stopped normally' ? 'ok' : 'warn';
+    div.innerHTML = `<div><b>${new Date(r.started).toLocaleTimeString()}</b> · ${Math.floor(s.secs / 60)}m ${s.secs % 60}s · ${(s.bytes / 1e6).toFixed(0)} MB · <span class="${cls}">${s.status}</span></div>
+      <p>${s.chunks.length} chunks, ${s.empty} empty, ${s.gaps} gaps over 3 s</p>
+      <div class="row"><button data-a="play">Play</button><button data-a="share">Save / share</button><button data-a="del">Delete</button></div>`;
+    div.querySelector('[data-a=play]').onclick = async () => {
+      const blob = await blobOf(s);
+      const v = document.createElement('video');
+      v.controls = true; v.playsInline = true; v.src = URL.createObjectURL(blob);
+      v.onloadedmetadata = () => { played[r.id] = isFinite(v.duration) ? Math.round(v.duration) + ' s' : String(v.duration); ev(`playback length ${played[r.id]} for ${new Date(r.started).toLocaleTimeString()}`); };
+      v.onerror = () => { played[r.id] = 'would not play'; ev(`playback failed for ${new Date(r.started).toLocaleTimeString()}`); };
+      div.appendChild(v);
+    };
+    // Safari only shares straight after a tap, so the file is built on the first tap and shared on the second.
+    let file = null;
+    const shareBtn = div.querySelector('[data-a=share]');
+    shareBtn.onclick = async () => {
+      if (!file) {
+        const ext = s.r.mime.includes('mp4') ? 'mp4' : 'webm';
+        file = new File([await blobOf(s)], `walkaround-test-${r.id}.${ext}`, { type: s.r.mime.split(';')[0] });
+        shareBtn.textContent = 'Tap again to share';
+        return;
+      }
+      if (navigator.canShare && navigator.canShare({ files: [file] })) {
+        try { await navigator.share({ files: [file] }); ev('shared'); } catch (e) { ev(`share: ${e.name}`); }
+      } else ev('this browser cannot share files');
+    };
+    div.querySelector('[data-a=del]').onclick = async () => { await delRec(r.id); await refreshEstimate(); renderRecs(); };
+    box.appendChild(div);
+  }
+}
+
+async function report() {
+  await refreshEstimate();
+  const L = [];
+  L.push('PHONE RECORDING TEST REPORT', new Date().toString(), env.ua);
+  L.push(`Home Screen app: ${env.standalone}`);
+  L.push(`MediaRecorder: ${env.mediaRecorder}; types: ${env.types.join(', ') || 'none'}`);
+  L.push(`Storage: ${env.usageMB} MB used of ${env.quotaMB} MB allowed; persisted before ${env.persistedBefore}, after asking ${env.persist}`);
+  L.push(`Camera: ${env.camera || 'not turned on'}; torch ${env.torch}; zoom ${env.zoom}; wake lock ${env.wakeLock}; file share ${env.share}`);
+  L.push(`Cameras listed: ${(env.cameras || []).join(' | ')}`);
+  const recs = (await all('recs')).sort((a, b) => a.started - b.started);
+  for (const r of recs) {
+    const s = await summary(r);
+    L.push('', `REC ${new Date(r.started).toLocaleTimeString()}: ${s.secs} s, ${(s.bytes / 1e6).toFixed(1)} MB, ${s.chunks.length} chunks, ${s.empty} empty, ${s.gaps} gaps, ${s.status}, played: ${played[r.id] || 'not played'}, ${r.mime}, ${r.camera}`);
+    for (const e of s.events.slice(0, 40)) L.push(`  +${Math.round((e.t - r.started) / 1000)}s ${e.msg}`);
+  }
+  const text = L.join('\n');
+  const box = $('#reportBox');
+  box.value = text; box.hidden = false;
+  try { await navigator.clipboard.writeText(text); ev('report copied'); }
+  catch (e) { box.select(); ev('copy blocked: select the text box and copy it'); }
+}
+
+// ---- page lifecycle ----
+document.addEventListener('visibilitychange', () => ev(`page ${document.visibilityState}`));
+window.addEventListener('pagehide', () => ev('page hidden by the system'));
+window.addEventListener('pageshow', e => ev(`page shown${e.persisted ? ' (restored)' : ''}`));
+
+$('#camOn').onclick = () => camOn().catch(e => ev(`camera refused: ${e.name} ${e.message}`));
+$('#camSel').onchange = e => camOn(e.target.value).catch(err => ev(`camera switch failed: ${err.name}`));
+$('#torch').onclick = async () => {
+  try {
+    torchOn = !torchOn;
+    await stream.getVideoTracks()[0].applyConstraints({ advanced: [{ torch: torchOn }] });
+    $('#torch').textContent = torchOn ? 'Torch off' : 'Torch';
+    ev(`torch ${torchOn ? 'on' : 'off'}`);
+  } catch (e) { ev(`torch failed: ${e.name}`); }
+};
+$('#recBtn').onclick = () => {
+  if (cur) recorder.stop();
+  else startRec().catch(e => ev(`could not start: ${e.name} ${e.message}`));
+};
+$('#reportBtn').onclick = () => report().catch(e => ev(`report failed: ${e.name}`));
+$('#delAll').onclick = async () => {
+  if (cur || !confirm('Delete every test recording on this phone?')) return;
+  for (const r of await all('recs')) await delRec(r.id);
+  await refreshEstimate(); renderRecs();
+};
+
+(async () => {
+  try { db = await openDB(); } catch (e) { ev(`storage would not open: ${e.name}`); return; }
+  await checkEnv();
+  ev(`page loaded; ${env.standalone ? 'Home Screen app' : 'Safari tab'}; storage persist ${env.persist}`);
+  renderRecs();
+})();
+</script>
+</body>
+</html>
