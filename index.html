@@ -6,9 +6,10 @@
 <meta name="apple-mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-title" content="Rec test">
 <link rel="manifest" href="manifest.webmanifest">
+<link rel="apple-touch-icon" href="icon-192.png">
 <title>Phone Recording Test</title>
 <!--
-  One-time test: can a web app on the shop's iPhone record a 3-10 minute walkaround
+  One-time test: can a web app on a phone (Android or iPhone) record a 3-10 minute walkaround
   reliably and keep it for upload later? (status.md; 35 § 13.)
   Videos stay on the phone. Nothing is uploaded. The report holds no video and no customer data.
 -->
@@ -61,9 +62,9 @@ textarea{width:100%;height:30vh;font:12px ui-monospace,Menlo,monospace;backgroun
 <div class="card">
   <h2 style="margin-top:0">Steps</h2>
   <ol>
-    <li>In Safari: Share → Add to Home Screen. Open it from the Home Screen icon.</li>
+    <li>Add it to the home screen. Android (Chrome): menu ⋮ → Add to Home screen → Install. iPhone (Safari): Share → Add to Home Screen. Then open it from the new icon.</li>
     <li>Turn the camera on, start recording, walk a car for about 10 minutes and talk as usual.</li>
-    <li>Partway through: pull down Control Center for 5 seconds. Lock the phone for 10 seconds, then unlock. Switch to another app and back.</li>
+    <li>Partway through: pull down the notification shade (iPhone: Control Center) for 5 seconds. Lock the phone for 10 seconds, then unlock. Switch to another app and back.</li>
     <li>Stop. Play it back below. Note any part with no picture or no sound.</li>
     <li>Record about 1 minute more, then swipe the app closed <b>without stopping</b>. Open it again: is that recording listed and playable?</li>
     <li>Tap "Copy report" and paste it to Claude.</li>
@@ -160,6 +161,8 @@ async function checkEnv() {
   env.types = ['video/mp4;codecs=avc1,mp4a', 'video/mp4', 'video/webm'].filter(m => env.mediaRecorder && MediaRecorder.isTypeSupported(m));
   env.wakeLock = 'wakeLock' in navigator;
   env.share = !!(navigator.canShare);
+  env.backgroundSync = 'SyncManager' in window;
+  env.backgroundFetch = 'BackgroundFetchManager' in window;
   if (navigator.storage) {
     try { env.persistedBefore = await navigator.storage.persisted(); } catch (e) { env.persistedBefore = 'error'; }
     try { env.persist = await navigator.storage.persist(); } catch (e) { env.persist = 'error ' + e.name; }
@@ -167,7 +170,7 @@ async function checkEnv() {
   }
   $('#mode').innerHTML = env.standalone
     ? '<span class="ok">Running from the Home Screen.</span>'
-    : '<span class="warn">Running in a Safari tab. For the real test, add it to the Home Screen and open it from there.</span>';
+    : '<span class="warn">Running in a browser tab. For the real test, add it to the home screen and open it from there.</span>';
   if (!env.mediaRecorder) ev('MediaRecorder is missing on this browser');
 }
 async function refreshEstimate() {
@@ -321,6 +324,7 @@ async function report() {
   L.push(`MediaRecorder: ${env.mediaRecorder}; types: ${env.types.join(', ') || 'none'}`);
   L.push(`Storage: ${env.usageMB} MB used of ${env.quotaMB} MB allowed; persisted before ${env.persistedBefore}, after asking ${env.persist}`);
   L.push(`Camera: ${env.camera || 'not turned on'}; torch ${env.torch}; zoom ${env.zoom}; wake lock ${env.wakeLock}; file share ${env.share}`);
+  L.push(`Background upload: sync ${env.backgroundSync}; fetch ${env.backgroundFetch}`);
   L.push(`Cameras listed: ${(env.cameras || []).join(' | ')}`);
   const recs = (await all('recs')).sort((a, b) => a.started - b.started);
   for (const r of recs) {
@@ -361,10 +365,12 @@ $('#delAll').onclick = async () => {
   await refreshEstimate(); renderRecs();
 };
 
+if ('serviceWorker' in navigator) navigator.serviceWorker.register('sw.js').catch(e => ev(`offline helper not registered: ${e.name}`));
+
 (async () => {
   try { db = await openDB(); } catch (e) { ev(`storage would not open: ${e.name}`); return; }
   await checkEnv();
-  ev(`page loaded; ${env.standalone ? 'Home Screen app' : 'Safari tab'}; storage persist ${env.persist}`);
+  ev(`page loaded; ${env.standalone ? 'home screen app' : 'browser tab'}; storage persist ${env.persist}`);
   renderRecs();
 })();
 </script>
