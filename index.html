@@ -85,7 +85,9 @@ textarea{width:100%;height:30vh;font:12px ui-monospace,Menlo,monospace;backgroun
 <script>
 const $ = s => document.querySelector(s);
 const BITRATE = 4000000; // 4 Mbps: about 300 MB per 10 minutes. Safari's default is higher.
-const GAP_MS = 3000;     // chunks are asked for every 1 s; a wait over 3 s is logged as a gap
+// Phones hand data over at their own pace (Chrome on the S25: every ~3.4 s, not the 1 s asked), so a gap
+// is a wait over 3x the recording's usual wait, and at least 10 s.
+const gapLimit = typical => Math.max(10000, 3 * typical);
 const env = {};
 let db, stream, recorder, cur = null, seq = 0, lastChunkAt = 0, wakeLock = null, tick = null, torchOn = false;
 const played = {};
@@ -222,7 +224,6 @@ async function startRec() {
   await put('recs', cur);
   recorder.ondataavailable = async e => {
     const n = seq++, now = Date.now();
-    if (lastChunkAt && now - lastChunkAt > GAP_MS) ev(`gap: no data for ${((now - lastChunkAt) / 1000).toFixed(1)} s`);
     lastChunkAt = now;
     if (!e.data.size) ev(`empty chunk #${n}`);
     try {
@@ -266,10 +267,12 @@ async function summary(r) {
   const events = (await byRec('events', r.id)).sort((a, b) => a.t - b.t);
   const bytes = chunks.reduce((a, c) => a + c.size, 0);
   const last = chunks.length ? chunks[chunks.length - 1].t : r.started;
-  let gaps = 0;
-  for (let i = 1; i < chunks.length; i++) if (chunks[i].t - chunks[i - 1].t > GAP_MS) gaps++;
+  const waits = chunks.slice(1).map((c, i) => c.t - chunks[i].t).sort((a, b) => a - b);
+  const typical = waits.length ? waits[Math.floor(waits.length / 2)] : 0;
+  const longest = waits.length ? waits[waits.length - 1] : 0;
+  const gaps = waits.filter(w => w > gapLimit(typical)).length;
   const status = r.ended ? 'stopped normally' : (cur && cur.id === r.id ? 'recording now' : 'cut off (app closed while recording)');
-  return { r, chunks, events, bytes, secs: Math.round((last - r.started) / 1000), empty: chunks.filter(c => !c.size).length, gaps, status };
+  return { r, chunks, events, bytes, secs: Math.round((last - r.started) / 1000), empty: chunks.filter(c => !c.size).length, gaps, typical, longest, status };
 }
 async function blobOf(s) {
   const chunks = (await byRec('chunks', s.r.id)).sort((a, b) => a.seq - b.seq);
@@ -287,7 +290,7 @@ async function renderRecs() {
     div.className = 'rec-item';
     const cls = s.status === 'stopped normally' ? 'ok' : 'warn';
     div.innerHTML = `<div><b>${new Date(r.started).toLocaleTimeString()}</b> · ${Math.floor(s.secs / 60)}m ${s.secs % 60}s · ${(s.bytes / 1e6).toFixed(0)} MB · <span class="${cls}">${s.status}</span></div>
-      <p>${s.chunks.length} chunks, ${s.empty} empty, ${s.gaps} gaps over 3 s</p>
+      <p>${s.chunks.length} chunks, ${s.empty} empty, data every ${(s.typical / 1000).toFixed(1)} s, longest wait ${(s.longest / 1000).toFixed(1)} s, ${s.gaps} gaps</p>
       <div class="row"><button data-a="play">Play</button><button data-a="share">Save / share</button><button data-a="del">Delete</button></div>`;
     div.querySelector('[data-a=play]').onclick = async () => {
       const blob = await blobOf(s);
@@ -329,8 +332,9 @@ async function report() {
   const recs = (await all('recs')).sort((a, b) => a.started - b.started);
   for (const r of recs) {
     const s = await summary(r);
-    L.push('', `REC ${new Date(r.started).toLocaleTimeString()}: ${s.secs} s, ${(s.bytes / 1e6).toFixed(1)} MB, ${s.chunks.length} chunks, ${s.empty} empty, ${s.gaps} gaps, ${s.status}, played: ${played[r.id] || 'not played'}, ${r.mime}, ${r.camera}`);
-    for (const e of s.events.slice(0, 40)) L.push(`  +${Math.round((e.t - r.started) / 1000)}s ${e.msg}`);
+    L.push('', `REC ${new Date(r.started).toLocaleTimeString()}: ${s.secs} s, ${(s.bytes / 1e6).toFixed(1)} MB, ${s.chunks.length} chunks, ${s.empty} empty, data every ${(s.typical / 1000).toFixed(1)} s, longest wait ${(s.longest / 1000).toFixed(1)} s, ${s.gaps} gaps, ${s.status}, played: ${played[r.id] || 'not played'}, ${r.mime}, ${r.camera}`);
+    // Older builds logged every slow chunk as 'gap:'; those lines crowded out the lock and app-switch events.
+    for (const e of s.events.filter(e => !e.msg.startsWith('gap:')).slice(0, 150)) L.push(`  +${Math.round((e.t - r.started) / 1000)}s ${e.msg}`);
   }
   const text = L.join('\n');
   const box = $('#reportBox');
